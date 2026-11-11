@@ -110,10 +110,155 @@ function install(doc) {
   }
 }
 
-/** 本插件不需要任何客户端服务。 */
+/**
+ * 功能二：权限策略 —— 去掉「完全权限」选项，新会话默认「自动审查」。
+ *
+ * 背景（DSH 0.2.2-rc.1 的权限预设，@deepseek-ai/dsh-client-ui-permission-presets）：
+ * 会话权限有四个预设值：read-only（仅可查看）、workspace-write（工作区内
+ * 修改）、danger-full-access（完全权限）、auto（自动审查，EXP）。「自动
+ * 审查」由实验层 @deepseek-ai/dsh-experimental-auto-review 提供：开启该层
+ * 后才出现在当前会话的选择器里；通用设置不提供 auto，新会话默认值里
+ * 也选不到它。宿主切换预设的通道是会话对象的 command(`/permission <值>`)，
+ * 带参命令直接生效、不弹风险确认。
+ *
+ * 本功能补两件事：
+ * 1. 界面移除完全权限：观察 DOM，把选择器/菜单/设置下拉里标签为「完全
+ *    权限 / Full access」的选项摘掉。只动界面——直接输入 /permission
+ *    danger-full-access 命令仍可达（宿主行为，不在本插件管辖内）。
+ * 2. 默认自动审查：轮询会话服务，第一次见到某个会话且其权限不是 auto
+ *    时，用宿主同一条命令通道切到 auto。每个会话只尝试一次：之后用户
+ *    手动改走，本插件不再干预；auto 不可用（实验层没开）时命令会失败，
+ *    记录一次日志便不再重试。
+ */
+
+/** 完全权限的预设机器值。 */
+export const FULL_ACCESS_PRESET = 'danger-full-access'
+/** 自动审查的预设机器值。 */
+export const AUTO_REVIEW_PRESET = 'auto'
+/** 完全权限在各语言界面里的选项标签（选项文字以标签开头）。 */
+export const FULL_ACCESS_LABELS = ['完全权限', 'Full access']
+
+/** 纯判定：一段选项文字是否就是「完全权限」选项（标签打头，或恰好相等）。 */
+export function isFullAccessLabel(text) {
+  if (typeof text !== 'string') return false
+  const t = text.trim()
+  return FULL_ACCESS_LABELS.some((label) => t === label || t.startsWith(label))
+}
+
+/** 纯判定：这个会话现在是否应该被切到自动审查。 */
+export function shouldAutoSwitch(preset, alreadyHandled) {
+  return preset !== undefined && preset !== null && preset !== AUTO_REVIEW_PRESET && !alreadyHandled
+}
+
+/**
+ * 防御式枚举宿主的 live 会话：优先 keys()+binding()，退回 list()。
+ * 服务形状对不上时安静返回空数组，绝不抛错。
+ */
+export function liveSessions(sessions) {
+  const out = []
+  if (!sessions || typeof sessions !== 'object') return out
+  try {
+    if (typeof sessions.keys === 'function' && typeof sessions.binding === 'function') {
+      for (const id of sessions.keys()) {
+        const live = sessions.binding(id)?.session
+        if (live) out.push({ id, live })
+      }
+      return out
+    }
+    if (typeof sessions.list === 'function') {
+      for (const s of sessions.list() ?? []) {
+        if (s && s.sessionId) out.push({ id: s.sessionId, live: s })
+      }
+    }
+  } catch { /* 服务形状不同：放弃枚举 */ }
+  return out
+}
+
+/** 读会话当前的权限预设值（投影不可用时返回 undefined）。 */
+export function currentPreset(live) {
+  try {
+    return live?.projections?.faceOf('permissions')?.getSnapshot?.()
+  } catch {
+    return undefined
+  }
+}
+
+/**
+ * 把「完全权限」选项从当前文档里摘掉：原生 select 的 option、弹出
+ * 选择器（role=listbox）与菜单（role=menu）里的 option/menuitem。
+ * @returns 摘掉的个数
+ */
+export function pruneFullAccess(doc) {
+  let removed = 0
+  for (const opt of doc.querySelectorAll('option')) {
+    if (isFullAccessLabel(opt.textContent)) { opt.remove(); removed++ }
+  }
+  for (const item of doc.querySelectorAll('[role="listbox"] [role="option"], [role="menu"] [role="menuitem"]')) {
+    if (isFullAccessLabel(item.textContent)) { item.remove(); removed++ }
+  }
+  return removed
+}
+
+/**
+ * 安装权限策略：DOM 观察（防抖扫描）+ 会话轮询（默认 auto）。
+ * getSessions 每次调用现取 ctx.sessions（服务可能晚于插件就绪）。
+ * @returns 卸载函数
+ */
+export function installPermissionPolicy(doc, getSessions, timers = { setInterval, clearInterval, setTimeout, clearTimeout }) {
+  let disposed = false
+  let scanTimer = 0
+  const scheduleScan = () => {
+    if (disposed || scanTimer) return
+    scanTimer = timers.setTimeout(() => {
+      scanTimer = 0
+      if (!disposed) pruneFullAccess(doc)
+    }, 120)
+  }
+  const observer = new MutationObserver(scheduleScan)
+  if (doc.body) observer.observe(doc.body, { childList: true, subtree: true })
+  pruneFullAccess(doc)
+
+  const handled = new Set()
+  const tick = async () => {
+    if (disposed) return
+    let sessions
+    try { sessions = getSessions() } catch { return }
+    for (const { id, live } of liveSessions(sessions)) {
+      if (handled.has(id)) continue
+      const preset = currentPreset(live)
+      if (!shouldAutoSwitch(preset, handled.has(id))) {
+        if (preset !== undefined && preset !== null) handled.add(id)
+        continue
+      }
+      handled.add(id)
+      if (typeof live.command !== 'function') continue
+      try {
+        const result = await live.command(`/permission ${AUTO_REVIEW_PRESET}`)
+        if (!result?.ok) console.info('[dsh-better-chat] auto review not applied for session', id, result?.error?.code ?? '')
+      } catch {
+        console.info('[dsh-better-chat] auto review switch failed for session', id)
+      }
+    }
+  }
+  const timer = timers.setInterval(() => { void tick() }, 2500)
+  void tick()
+
+  return () => {
+    disposed = true
+    observer.disconnect()
+    if (scanTimer) timers.clearTimeout(scanTimer)
+    timers.clearInterval(timer)
+  }
+}
+
+/** 本插件不硬依赖任何客户端服务（sessions 服务是可选增强，缺了只是不自动切）。 */
 export const inject = []
 
-/** 插件主体：挂载审批快捷键增强，卸载时完整摘除。 */
+/** 插件主体：挂载两组增强，卸载时完整摘除。 */
 export function apply(ctx) {
   ctx.effect(() => install(document), 'dsh-better-chat: approval enter/esc routing')
+  ctx.effect(
+    () => installPermissionPolicy(document, () => ctx.sessions),
+    'dsh-better-chat: permission policy (no full access, auto review by default)',
+  )
 }
