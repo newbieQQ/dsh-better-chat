@@ -16,7 +16,7 @@ const root = join(dirname(fileURLToPath(import.meta.url)), '..')
 const source = readFileSync(join(root, 'client.js'), 'utf8')
 
 const exported = []
-const body = source.replace(/^export (function|const) ([A-Za-z_$][\w$]*)/gm, (match, kind, name) => {
+const body = source.replace(/^export (async function|function|const) ([A-Za-z_$][\w$]*)/gm, (match, kind, name) => {
   exported.push(name)
   return kind + ' ' + name
 })
