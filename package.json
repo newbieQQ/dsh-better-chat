@@ -1,12 +1,12 @@
 {
   "name": "dsh-better-chat",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "DSH 聊天增强插件：审批卡片全局回车批准 / Esc 拒绝",
   "type": "module",
   "main": "index.js",
   "exports": {
     ".": "./index.js",
-    "./client": "./client.js",
+    "./client": "./lib/client.js",
     "./cordis.patch.yml": "./cordis.patch.yml",
     "./package.json": "./package.json"
   },
@@ -20,7 +20,8 @@
     }
   },
   "scripts": {
-    "test": "node --test tests/approval-keys.test.mjs"
+    "test": "node --test tests/approval-keys.test.mjs tests/permission-policy.test.mjs tests/client-loader.test.mjs",
+    "build": "node scripts/build-client.mjs"
   },
   "license": "MIT"
 }
